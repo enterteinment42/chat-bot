@@ -28,7 +28,7 @@ export function daysLeft(iso) {
 }
 
 // Вытаскивает JSON-объект из ответа LLM (модель может обернуть его в ```json ... ``` или прозу)
-function extractJson(content) {
+export function extractJson(content) {
   try { return JSON.parse(content); } catch {}
   const m = String(content).match(/\{[\s\S]*\}/);
   if (m) { try { return JSON.parse(m[0]); } catch {} }

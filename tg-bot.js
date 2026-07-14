@@ -6,6 +6,7 @@ import crypto from 'node:crypto';
 import { createClient } from '@supabase/supabase-js';
 import ws from 'ws';
 import * as crm from './crm.js';
+import * as catAdmin from './catalog-admin.js';
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY, { realtime: { transport: ws } });
 
@@ -61,6 +62,11 @@ async function handleMessage(msg) {
     }
     if (/^(продал|продлил|\/sold)\b/i.test(text)) {
       await handleAdminSale(chatId, text);
+      return;
+    }
+    // Команды каталогом (ЧБ-10): «скрой Mad Max», «цена FC 26 4990», «скидка GTA V 20%»
+    if (/^(скрой|спрячь|покажи|верни|подними|снизь|поставь|цен[ауы]|скидк|убери)/i.test(text)) {
+      await handleAdminCatalog(chatId, text);
       return;
     }
   }
@@ -246,6 +252,63 @@ async function handleCallback(cbq) {
     return;
   }
 
+  // Кнопки команд каталогом (ЧБ-10) — только для владельца
+  if (data.startsWith('ca:')) {
+    if (cbq.from?.id !== ADMIN_CHAT_ID) {
+      await tg('answerCallbackQuery', { callback_query_id: cbq.id });
+      return;
+    }
+    const [, sub, opId, extra] = data.split(':');
+    const op = pendingCatOps.get(opId);
+    let answer = '';
+    try {
+      if (!op) {
+        answer = 'Команда устарела — повтори текстом';
+        if (cbq.message) await tg('editMessageReplyMarkup', { chat_id: chatId, message_id: cbq.message.message_id, reply_markup: { inline_keyboard: [] } }).catch(() => {});
+      } else if (sub === 'no') {
+        pendingCatOps.delete(opId);
+        answer = 'Отменил';
+        if (cbq.message) await tg('editMessageText', { chat_id: chatId, message_id: cbq.message.message_id, text: '❌ Отменено, в каталоге ничего не менял.' }).catch(() => {});
+      } else if (sub === 'g') {
+        // Выбор игры из нескольких найденных → карточка подтверждения
+        const g = op.candidates?.[Number(extra)];
+        if (!g) {
+          answer = 'Вариант не найден, повтори команду';
+        } else {
+          op.game = g;
+          const noop = catNoopText(op.action, g);
+          if (noop) {
+            pendingCatOps.delete(opId);
+            await tg('editMessageText', { chat_id: chatId, message_id: cbq.message.message_id, text: noop, parse_mode: 'HTML' });
+          } else {
+            await tg('editMessageText', {
+              chat_id: chatId, message_id: cbq.message.message_id,
+              text: catConfirmCard(op), parse_mode: 'HTML',
+              reply_markup: { inline_keyboard: [[
+                { text: '✅ Применить', callback_data: `ca:ok:${opId}` },
+                { text: '❌ Отмена',   callback_data: `ca:no:${opId}` },
+              ]] },
+            });
+          }
+        }
+      } else if (sub === 'ok') {
+        if (!op.game) {
+          answer = 'Сначала выбери игру из списка';
+        } else {
+          const updated = await catAdmin.applyOp({ action: op.action, gameId: op.game.id, value: op.value });
+          pendingCatOps.delete(opId); // удаляем только после успешной записи — при ошибке кнопку можно нажать ещё раз
+          answer = 'Записал в черновик ✅';
+          await tg('editMessageText', { chat_id: chatId, message_id: cbq.message.message_id, text: catAppliedText(op.action, updated), parse_mode: 'HTML' }).catch(() => {});
+        }
+      }
+    } catch (e) {
+      console.error('[cat-admin callback]', e.message);
+      answer = `Ошибка: ${e.message}`.slice(0, 190);
+    }
+    await tg('answerCallbackQuery', { callback_query_id: cbq.id, text: answer });
+    return;
+  }
+
   await tg('answerCallbackQuery', { callback_query_id: cbq.id });
   if (!chatId) return;
 
@@ -321,6 +384,110 @@ async function sendClientList(chatId) {
   } catch (e) {
     console.error('[crm list]', e.message);
     await tg('sendMessage', { chat_id: chatId, text: `⚠️ Не удалось получить список: ${e.message}` });
+  }
+}
+
+// ===== Команды каталогом (ЧБ-10): скрыть/показать игру, цена, скидка =====
+// Запись в черновик магазина ТОЛЬКО после кнопки «✅ Применить». Публикация — вручную из админки.
+
+// Ожидающие подтверждения операции: opId → { action, value, game?, candidates?, createdAt }.
+// Живут в памяти: при рестарте бота кнопки старых карточек ответят «команда устарела».
+const pendingCatOps = new Map();
+const CAT_OP_TTL = 15 * 60 * 1000;
+
+function prunePendingCatOps() {
+  const now = Date.now();
+  for (const [id, op] of pendingCatOps) {
+    if (now - op.createdAt > CAT_OP_TTL) pendingCatOps.delete(id);
+  }
+}
+
+function fmtPrice(n) {
+  return `${Number(n || 0).toLocaleString('ru-RU')} ₽`;
+}
+
+// Операция, которую применять не к чему («скрой» уже скрытую и т.п.) — вернёт текст, иначе null
+function catNoopText(action, g) {
+  const title = `<b>${escapeHtml(g.title)}</b>`;
+  if (action === 'hide' && g.hidden) return `${title} уже скрыта из магазина.`;
+  if (action === 'show' && !g.hidden) return `${title} и так видна в магазине.`;
+  if (action === 'clear_discount' && !g.discount) return `У ${title} и так нет скидки.`;
+  return null;
+}
+
+function catConfirmCard(op) {
+  const g = op.game;
+  const title = `<b>${escapeHtml(g.title)}</b>`;
+  let body = '';
+  if (op.action === 'hide') body = `Скрою из магазина ${title} (${fmtPrice(g.priceRUB)}).`;
+  if (op.action === 'show') body = `Верну в магазин ${title} (${fmtPrice(g.priceRUB)}).`;
+  if (op.action === 'set_price') {
+    body = `Цена ${title}: ${fmtPrice(g.priceRUB)} → <b>${fmtPrice(op.value)}</b>. Цена будет защищена от пересканирования (ручная).`;
+    if (g.discount) body += `\nУ игры скидка −${g.discount}%: новая цена — конечная, «старая» на сайте пересчитается.`;
+  }
+  if (op.action === 'set_discount') body = `Скидка на ${title}: ${g.discount ? `−${g.discount}%` : 'нет'} → <b>−${op.value}%</b> (конечная цена ${fmtPrice(g.priceRUB)} не меняется).`;
+  if (op.action === 'clear_discount') body = `Уберу скидку −${g.discount}% с ${title}.`;
+  return `${body}\n\nЗапишу в черновик — на сайт попадёт после публикации из админки. Применить?`;
+}
+
+function catAppliedText(action, g) {
+  const title = `<b>${escapeHtml(g.title)}</b>`;
+  const what = {
+    hide: `скрыл ${title}`,
+    show: `вернул ${title} в магазин`,
+    set_price: `цена ${title} теперь ${fmtPrice(g.priceRUB)}`,
+    set_discount: `скидка на ${title} теперь −${g.discount}%`,
+    clear_discount: `убрал скидку с ${title}`,
+  }[action];
+  return `✅ Записал в черновик: ${what}.\nНа сайте появится после публикации из админки.\n⚠️ Если админка сейчас открыта в браузере — переоткрой её перед публикацией, иначе её автосохранение затрёт эту правку.`;
+}
+
+// «скрой X / цена X N / скидка X N» — разбор через LLM, поиск игры, карточка-подтверждение
+async function handleAdminCatalog(chatId, text) {
+  await tg('sendChatAction', { chat_id: chatId, action: 'typing' });
+  try {
+    const cmd = await catAdmin.parseCommand(text);
+    const data = await catAdmin.loadDraftData();
+    const matches = catAdmin.findGames(data.games || [], cmd.game);
+    if (!matches.length) {
+      await tg('sendMessage', { chat_id: chatId, text: `Не нашёл «${escapeHtml(cmd.game)}» в каталоге (искал и среди скрытых).`, parse_mode: 'HTML' });
+      return;
+    }
+    prunePendingCatOps();
+    const opId = crypto.randomUUID().replace(/-/g, '').slice(0, 8);
+    const op = { action: cmd.action, value: cmd.value, createdAt: Date.now() };
+    if (matches.length === 1) {
+      const g = matches[0];
+      const noop = catNoopText(cmd.action, g);
+      if (noop) {
+        await tg('sendMessage', { chat_id: chatId, text: noop, parse_mode: 'HTML' });
+        return;
+      }
+      op.game = g;
+      pendingCatOps.set(opId, op);
+      await tg('sendMessage', {
+        chat_id: chatId, text: catConfirmCard(op), parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [[
+          { text: '✅ Применить', callback_data: `ca:ok:${opId}` },
+          { text: '❌ Отмена',   callback_data: `ca:no:${opId}` },
+        ]] },
+      });
+    } else {
+      // Несколько совпадений — в callback_data только индекс кандидата (лимит TG 64 байта)
+      op.candidates = matches;
+      pendingCatOps.set(opId, op);
+      const rows = matches.map((g, i) => [{ text: `${g.title} — ${fmtPrice(g.priceRUB)}${g.hidden ? ' (скрыта)' : ''}`, callback_data: `ca:g:${opId}:${i}` }]);
+      rows.push([{ text: '❌ Отмена', callback_data: `ca:no:${opId}` }]);
+      await tg('sendMessage', {
+        chat_id: chatId,
+        text: `Нашёл несколько игр по «${escapeHtml(cmd.game)}» — какую?`,
+        parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: rows },
+      });
+    }
+  } catch (e) {
+    console.error('[cat-admin]', e.message);
+    await tg('sendMessage', { chat_id: chatId, text: `⚠️ ${e.message}` });
   }
 }
 
