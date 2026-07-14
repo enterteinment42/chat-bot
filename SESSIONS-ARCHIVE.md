@@ -4,6 +4,32 @@
 
 ---
 
+### 2026-06-05 (сессия 16)
+
+**Что сделано:**
+- `js/chatbot.js` — баг дублирующегося приветствия: флаг `_chatWelcomed`; тултип «Помогу с выбором 🎮» (через 4 сек, 10 сек видим); быстрые кнопки-подсказки в пустом чате; пульсирующий badge на иконке (гаснет при открытии); история в `localStorage` + `_saveHistory()/_loadHistory()`; функция `resetChat()` (кнопка ↺ в шапке); проверка `_chat_disabled` + `BroadcastChannel('chat-widget')` для вкл/выкл из админки
+- `js/chatbot.js` — карточка рекомендаций переработана: цена + скидка под названием; кнопка «↗ Витрина» скроллит к `#gr-{gameId}` и мигает `chat-highlight` 2 сек; кнопка «💬 Написать менеджеру» в отдельной полосе под инпутом
+- `styles.css` — стили: badge-анимация, тултип со стрелкой, `.chat-rec-bottom`, `.chat-highlight`, `.chat-manager-bar`, `.chat-new-btn`, мобильный `bottom:80px`
+- `index.html` — тултип, кнопка ↺, полоса менеджера, обновлён аккордеон «💬 Чат-бот»: вкл/выкл виджет, два провайдера (Anthropic/OR), кнопка логов
+- `js/admin-core.js` — `toggleChatWidget()`, `_updateWidgetToggleBtn()`, `downloadChatLogs()`; модели обновлены: Anthropic Direct (Sonnet 4.6, Haiku 4.5), OpenRouter (Gemini Flash 3.5 `~google/gemini-flash-latest`, Gemini Pro 3.1 `google/gemini-3.1-pro-preview`, ChatGPT 5.4 `~openai/gpt-latest`, ChatGPT Mini 5.4 `openai/gpt-5.4-mini`); читаемые лейблы в дропдауне
+- `Standalone/chat-bot/server.js` — новый endpoint `GET /admin/logs` (последние 500 диалогов из `chat_conversations`, требует `X-Admin-Token`); задеплоен на VPS
+
+**Что решили:**
+- Алиасы моделей OpenRouter: брать из editorial bot (`~/poigraem-chatbot/../corespondbot/editorial-bot.js`), не угадывать по сайту
+- Вкл/выкл виджета через `localStorage._chat_disabled` — без VPS, мгновенно; BroadcastChannel синхронизирует открытые вкладки
+- История в localStorage (не sessionStorage) — диалог выживает между визитами; ↺ сбрасывает полностью
+
+**Новые баги:** не обнаружено.
+
+**Открытые вопросы:**
+- Всё задеплоено, но визуально не проверено — нужно открыть сайт и проверить админку + виджет
+
+**Что осталось:**
+- Этап 5: red-teaming по чек-листу
+- `channel: 'telegram'` в tg-bot.js (отложено)
+
+---
+
 ### 2026-06-05 (сессия 15)
 
 **Что сделано:**
