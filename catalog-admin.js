@@ -51,9 +51,10 @@ export async function parseCommand(text) {
 }
 
 async function storeFetch(path, opts = {}) {
+  // Бэкенд магазина (в отличие от эндпоинтов самого чат-бота) ждёт Authorization: Bearer, не X-Admin-Token
   const r = await fetch(`${STORE_API}${path}`, {
     ...opts,
-    headers: { 'Content-Type': 'application/json', 'X-Admin-Token': process.env.ADMIN_TOKEN || '', ...(opts.headers || {}) },
+    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${process.env.ADMIN_TOKEN || ''}`, ...(opts.headers || {}) },
   });
   if (!r.ok) throw new Error(`Магазин ответил ${r.status} на ${path}`);
   return r.json();
