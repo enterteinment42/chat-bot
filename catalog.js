@@ -76,3 +76,10 @@ export async function loadCatalog() {
     return null;
   }
 }
+
+// ARCH-4: принудительный сброс кэша каталога — зовётся из магазина после публикации
+// (POST /admin/reload-catalog), чтобы бот не советовал скрытые игры и старые цены до часа.
+export function invalidateCatalog() {
+  _cache = null;
+  _cacheTime = 0;
+}

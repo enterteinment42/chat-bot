@@ -7,7 +7,7 @@ import { createClient } from '@supabase/supabase-js';
 import ws from 'ws';
 import { chat, bootstrapSettings, clearSettingsCache } from './llm.js';
 import { buildSystemPrompt } from './prompt.js';
-import { loadCatalog } from './catalog.js';
+import { loadCatalog, invalidateCatalog } from './catalog.js';
 import { logConversation } from './logger.js';
 
 const app = express();
@@ -54,6 +54,20 @@ const reminderLimit = makeLimit(86_400_000, 10, 'Слишком много на�
 // GET /health
 app.get('/health', (_req, res) => {
   res.json({ status: 'ok', service: 'chatbot', version: '1.0.0' });
+});
+
+// POST /admin/reload-catalog — ARCH-4: сброс часового кэша каталога после публикации
+// в магазине. Зовётся бэкендом магазина по петле (127.0.0.1) сразу после /db/publish,
+// чтобы бот не советовал скрытые игры и старые цены до истечения TTL.
+// Разрешено: запрос с петлевого адреса (внутренний вызов) ИЛИ с верным X-Admin-Token.
+app.post('/admin/reload-catalog', (req, res) => {
+  const ip = req.socket?.remoteAddress || '';
+  const isLoopback = ip === '127.0.0.1' || ip === '::1' || ip === '::ffff:127.0.0.1';
+  const tokenOk = req.headers['x-admin-token'] === process.env.ADMIN_TOKEN;
+  if (!isLoopback && !tokenOk) return res.status(401).json({ error: 'unauthorized' });
+  invalidateCatalog();
+  console.log(`[${new Date().toISOString()}] catalog cache invalidated (reload-catalog)`);
+  res.json({ ok: true });
 });
 
 // POST /api/chat
