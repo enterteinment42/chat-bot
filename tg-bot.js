@@ -7,6 +7,7 @@ import { createClient } from '@supabase/supabase-js';
 import ws from 'ws';
 import * as crm from './crm.js';
 import * as catAdmin from './catalog-admin.js';
+import * as adminRouter from './admin-router.js';
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY, { realtime: { transport: ws } });
 
@@ -60,7 +61,8 @@ async function handleMessage(msg) {
       await sendClientList(chatId);
       return;
     }
-    if (/^(продал|продлил|\/sold)\b/i.test(text)) {
+    // (\s|$) вместо \b: в JS \b не работает после кириллицы — «продал ...» никогда не совпадал
+    if (/^(продал|продлил|оформил|\/sold)(\s|$)/i.test(text)) {
       await handleAdminSale(chatId, text);
       return;
     }
@@ -68,6 +70,18 @@ async function handleMessage(msg) {
     if (/^(скрой|спрячь|покажи|верни|подними|снизь|поставь|цен[ауы]|скидк|убери)/i.test(text)) {
       await handleAdminCatalog(chatId, text);
       return;
+    }
+    // Быстрые шаблоны не сработали, но сообщение похоже на админскую заметку —
+    // LLM-роутер решает: продажа в свободной формулировке, команда каталогу или просто тест бота.
+    // При сомнении роутер выбирает «продажа» (карточку можно отменить, потерянная запись — нет).
+    if (adminRouter.looksAdminish(text)) {
+      try {
+        const intent = await adminRouter.classifyAdminIntent(text);
+        if (intent === 'sale' || intent === 'renewal') { await handleAdminSale(chatId, text); return; }
+        if (intent === 'catalog') { await handleAdminCatalog(chatId, text); return; }
+      } catch (e) {
+        console.error('[admin-router]', e.message); // роутер упал — идём обычным путём клиентского бота
+      }
     }
   }
 
