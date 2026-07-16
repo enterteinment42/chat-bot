@@ -7,7 +7,7 @@ import { createClient } from '@supabase/supabase-js';
 import ws from 'ws';
 import { chat, bootstrapSettings, clearSettingsCache } from './llm.js';
 import { buildSystemPrompt } from './prompt.js';
-import { loadCatalog, invalidateCatalog } from './catalog.js';
+import { loadCatalog, clearCatalogCache } from './catalog.js';
 import { logConversation } from './logger.js';
 
 const app = express();
@@ -56,17 +56,20 @@ app.get('/health', (_req, res) => {
   res.json({ status: 'ok', service: 'chatbot', version: '1.0.0' });
 });
 
-// POST /admin/reload-catalog — ARCH-4: сброс часового кэша каталога после публикации
-// в магазине. Зовётся бэкендом магазина по петле (127.0.0.1) сразу после /db/publish,
-// чтобы бот не советовал скрытые игры и старые цены до истечения TTL.
-// Разрешено: запрос с петлевого адреса (внутренний вызов) ИЛИ с верным X-Admin-Token.
+// POST /admin/reload-catalog — ARCH-4: poigraem-backend дёргает этот роут сразу
+// после /db/publish, чтобы сбросить часовой TTL кэша каталога (иначе бот
+// до часа советует скрытые игры и старые цены).
+// Только localhost: легитимный вызов — backend напрямую на 127.0.0.1:3002,
+// минуя nginx, поэтому без X-Forwarded-For. Любой внешний запрос идёт через
+// nginx (location /chatbot/), который всегда дописывает X-Forwarded-For
+// (proxy_add_x_forwarded_for) — по наличию этого заголовка и отсекаем.
+// Первая версия проверяла req.socket.remoteAddress === 127.0.0.1 — бесполезно
+// за прокси: nginx всегда открывает соединение с бэкендом с loopback-адреса,
+// вне зависимости от реального клиента (найдено при деплое на VPS 2026-07-16).
+// Токен не нужен: сам путь снаружи недостижим.
 app.post('/admin/reload-catalog', (req, res) => {
-  const ip = req.socket?.remoteAddress || '';
-  const isLoopback = ip === '127.0.0.1' || ip === '::1' || ip === '::ffff:127.0.0.1';
-  const tokenOk = req.headers['x-admin-token'] === process.env.ADMIN_TOKEN;
-  if (!isLoopback && !tokenOk) return res.status(401).json({ error: 'unauthorized' });
-  invalidateCatalog();
-  console.log(`[${new Date().toISOString()}] catalog cache invalidated (reload-catalog)`);
+  if (req.headers['x-forwarded-for']) return res.status(403).json({ error: 'forbidden' });
+  clearCatalogCache();
   res.json({ ok: true });
 });
 

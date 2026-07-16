@@ -77,9 +77,9 @@ export async function loadCatalog() {
   }
 }
 
-// ARCH-4: принудительный сброс кэша каталога — зовётся из магазина после публикации
-// (POST /admin/reload-catalog), чтобы бот не советовал скрытые игры и старые цены до часа.
-export function invalidateCatalog() {
+// ARCH-4: сброс по внешнему сигналу (после публикации в poigraem-backend),
+// чтобы не ждать до часа TTL со старыми ценами/скрытыми играми.
+export function clearCatalogCache() {
   _cache = null;
   _cacheTime = 0;
 }
