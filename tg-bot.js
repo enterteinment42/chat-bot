@@ -370,7 +370,7 @@ async function handleAdminSale(chatId, text) {
     let card = `${renewed ? '🔁 Продлил' : '✅ Записал'}: ${clientLabel(record)} — <b>${escapeHtml(record.sub_name)}</b> до ${crm.fmtDate(record.expires_at)}`;
     if (renewed) card += `\n(было до ${crm.fmtDate(prevExpires)})`;
     if (record.note) card += `\n📝 ${escapeHtml(record.note)}`;
-    card += `\n\nНапомню за 7 дней до окончания и в день окончания. Список: /clients`;
+    card += `\n\nНапомню за 5 дней до окончания и в день окончания. Список: /clients`;
     const buttons = renewed
       ? [[{ text: '↩️ Вернуть прежнюю дату', callback_data: `cs:rvt:${record.id}:${prevExpires}` }]]
       : [[{ text: '❌ Отменить запись', callback_data: `cs:del:${record.id}` }]];
@@ -505,7 +505,7 @@ async function handleAdminCatalog(chatId, text) {
   }
 }
 
-// Ежедневно: напоминания владельцу за 7 дней и в день окончания, с черновиком сообщения клиенту
+// Ежедневно: напоминания владельцу за 5 дней и в день окончания, с черновиком сообщения клиенту
 async function checkClientSubs() {
   if (!ADMIN_CHAT_ID) return;
   try {

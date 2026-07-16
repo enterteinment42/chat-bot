@@ -121,12 +121,12 @@ export async function recordSale(p) {
 // Записи, по которым пора напомнить владельцу. Каждая попадает только в одну стадию.
 export async function dueReminders() {
   const today = todayISO();
-  const in7 = new Date(Date.now() + 7 * 86400000).toISOString().split('T')[0];
+  const in5 = new Date(Date.now() + 5 * 86400000).toISOString().split('T')[0];
   const { data, error } = await supabase
     .from('client_subs')
     .select('*')
     .eq('status', 'active')
-    .lte('expires_at', in7);
+    .lte('expires_at', in5);
   if (error) { console.error('[crm] dueReminders:', error.message); return { stage0: [], stage7: [] }; }
   const rows = (data || []).filter(r => !r.snooze_until || r.snooze_until <= today);
   const stage0 = rows.filter(r => r.expires_at <= today && !r.reminded_0d_at);
