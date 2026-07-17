@@ -255,6 +255,18 @@ async function handleCallback(cbq) {
       if (action === 'tm')  { await crm.snooze(Number(id), Number(extra)); answer = 'Напомню завтра 🔁'; }
       if (action === 'del') { await crm.removeRecord(Number(id)); answer = 'Запись удалена'; }
       if (action === 'rvt') { await crm.restoreExpires(Number(id), extra); answer = `Вернул дату: ${crm.fmtDate(extra)}`; }
+      if (action === 'rn')  {
+        // «Продлил на тот же срок» из напоминания — карточка как у «продлил …» текстом
+        const { record, prevExpires } = await crm.renewSame(Number(id));
+        answer = `Продлил до ${crm.fmtDate(record.expires_at)} ✅`;
+        await tg('sendMessage', {
+          chat_id: chatId,
+          text: `🔁 Продлил: ${clientLabel(record)} — <b>${escapeHtml(record.sub_name)}</b> до ${crm.fmtDate(record.expires_at)}\n(было до ${crm.fmtDate(prevExpires)})`,
+          parse_mode: 'HTML',
+          disable_web_page_preview: true,
+          reply_markup: { inline_keyboard: [[{ text: '↩️ Вернуть прежнюю дату', callback_data: `cs:rvt:${record.id}:${prevExpires}` }]] },
+        });
+      }
       // Убираем кнопки, чтобы не нажать повторно
       if (cbq.message) {
         await tg('editMessageReplyMarkup', { chat_id: chatId, message_id: cbq.message.message_id, reply_markup: { inline_keyboard: [] } }).catch(() => {});
@@ -552,16 +564,19 @@ async function checkClientSubs() {
           } catch (e) {
             console.error('[crm draft]', e.message);
           }
+          const keyboard = [[
+            { text: '✅ Написал', callback_data: `cs:ok:${r.id}` },
+            { text: '🔁 Завтра', callback_data: `cs:tm:${r.id}:${stage}` },
+            { text: '❌ Не продлил', callback_data: `cs:no:${r.id}` },
+          ]];
+          // Срок последней продажи известен → продление одной кнопкой, без набора текста
+          if (r.months) keyboard.push([{ text: `🔄 Продлил на ${r.months} мес`, callback_data: `cs:rn:${r.id}` }]);
           await tg('sendMessage', {
             chat_id: ADMIN_CHAT_ID,
             text,
             parse_mode: 'HTML',
             disable_web_page_preview: true,
-            reply_markup: { inline_keyboard: [[
-              { text: '✅ Написал', callback_data: `cs:ok:${r.id}` },
-              { text: '🔁 Завтра', callback_data: `cs:tm:${r.id}:${stage}` },
-              { text: '❌ Не продлил', callback_data: `cs:no:${r.id}` },
-            ]] },
+            reply_markup: { inline_keyboard: keyboard },
           });
           await crm.markReminded(r.id, stage);
           console.log(`[crm] reminder stage=${stage} id=${r.id} "${r.client_name}"`);

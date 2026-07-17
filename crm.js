@@ -121,6 +121,7 @@ export async function recordSale(p) {
         .update({
           sub_name: p.sub_name || old.sub_name,
           expires_at: expires,
+          months: p.months || old.months, // срок последней продажи — для кнопки «продлил на тот же срок»
           status: 'active',
           reminded_7d_at: null,
           reminded_0d_at: null,
@@ -145,6 +146,7 @@ export async function recordSale(p) {
       client_link: p.client_link,
       sub_name: p.sub_name,
       expires_at: expires,
+      months: p.months, // null, если срок задан датой
       note: p.note,
     })
     .select()
@@ -199,6 +201,30 @@ export async function snooze(id, stage) {
 export async function removeRecord(id) {
   const { error } = await supabase.from('client_subs').delete().eq('id', id);
   if (error) throw new Error(error.message);
+}
+
+// Продление «на тот же срок» одной кнопкой из напоминания. Требует сохранённого months.
+export async function renewSame(id) {
+  const { data: old, error } = await supabase.from('client_subs').select('*').eq('id', id).single();
+  if (error || !old) throw new Error('Запись не нашлась — возможно, удалена.');
+  if (!old.months) throw new Error('Не знаю прежний срок — напиши «продлил …» текстом с указанием срока.');
+  // Отсчитываем от текущей даты окончания, если она в будущем, иначе от сегодня
+  const base = old.expires_at > todayISO() ? old.expires_at : todayISO();
+  const { data, error: e2 } = await supabase
+    .from('client_subs')
+    .update({
+      expires_at: addMonths(base, old.months),
+      status: 'active',
+      reminded_7d_at: null,
+      reminded_0d_at: null,
+      snooze_until: null,
+      updated_at: new Date().toISOString(),
+    })
+    .eq('id', id)
+    .select()
+    .single();
+  if (e2) throw new Error(`Supabase: ${e2.message}`);
+  return { record: data, prevExpires: old.expires_at };
 }
 
 export async function restoreExpires(id, prevExpires) {
