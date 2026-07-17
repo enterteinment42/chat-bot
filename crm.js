@@ -61,9 +61,35 @@ export async function parseSale(text) {
   if (!p.months && !p.expires_date) {
     throw new Error(`Не понял срок подписки для «${p.client_name} — ${p.sub_name}». Укажи, на сколько месяцев или до какой даты.`);
   }
+  // LLM-вывод идёт прямо в базу — не доверяем ему без границ (урок Б-4)
+  if (!p.months) p.months = null; // 0/пусто = «не указан», срок возьмём из expires_date
+  else {
+    p.months = Math.round(Number(p.months));
+    if (!Number.isFinite(p.months) || p.months < 1 || p.months > 36) {
+      throw new Error(`Подозрительный срок: ${p.months} мес. Жду от 1 до 36 месяцев.`);
+    }
+  }
+  if (p.expires_date != null) {
+    const yearAgo = new Date(Date.now() - 366 * 86400000).toISOString().split('T')[0];
+    const in4y = new Date(Date.now() + 4 * 366 * 86400000).toISOString().split('T')[0];
+    const valid = /^\d{4}-\d{2}-\d{2}$/.test(String(p.expires_date)) && !isNaN(Date.parse(p.expires_date + 'T12:00:00Z'));
+    if (!valid || p.expires_date < yearAgo || p.expires_date > in4y) {
+      throw new Error(`Подозрительная дата окончания: «${p.expires_date}». Назови её явно, например «до 15 января 2027».`);
+    }
+  }
   if (!['avito', 'vk', 'tg', 'other'].includes(p.channel)) p.channel = 'other';
+  p.client_name = String(p.client_name).trim().slice(0, 80);
+  p.sub_name = String(p.sub_name).trim().slice(0, 60);
   if (p.client_name.startsWith('@')) p.client_name = p.client_name.slice(1);
   return p;
+}
+
+// Совпадение подписок: «Game Pass» ≈ «Game Pass Ultimate», но «PS Plus Extra» ≠ «PS Plus Essential»
+function sameSub(a, b) {
+  const na = String(a || '').toLowerCase().replace(/[^a-zа-я0-9]+/gi, ' ').trim();
+  const nb = String(b || '').toLowerCase().replace(/[^a-zа-я0-9]+/gi, ' ').trim();
+  if (!na || !nb) return false;
+  return na.includes(nb) || nb.includes(na);
 }
 
 // Сохраняет продажу. Для intent=renewal ищет существующую запись клиента и продлевает её.
@@ -73,11 +99,20 @@ export async function recordSale(p) {
     const { data: existing } = await supabase
       .from('client_subs')
       .select('*')
-      .ilike('client_name', p.client_name)
+      .ilike('client_name', p.client_name.replace(/([%_\\])/g, '\\$1')) // % и _ в имени — не wildcards
       .order('expires_at', { ascending: false })
-      .limit(1);
-    if (existing?.length) {
-      const old = existing[0];
+      .limit(10);
+    // У клиента может быть несколько подписок — продлеваем только ту же самую, иначе
+    // «продлил Ивану Game Pass» перезаписал бы его запись о PS Plus. Нет совпадения
+    // по подписке → упадём вниз и запишем как новую (ничего чужого не трогаем).
+    let candidates = (existing || []).filter(r => sameSub(r.sub_name, p.sub_name));
+    // Тёзки с разных каналов: если канал назван — сужаем по нему
+    if (candidates.length > 1 && p.channel !== 'other') {
+      const byChannel = candidates.filter(r => r.channel === p.channel);
+      if (byChannel.length) candidates = byChannel;
+    }
+    if (candidates.length) {
+      const old = candidates[0];
       // Продление отсчитываем от текущей даты окончания, если она в будущем, иначе от сегодня
       const base = old.expires_at > todayISO() ? old.expires_at : todayISO();
       const expires = p.expires_date || addMonths(base, p.months);
