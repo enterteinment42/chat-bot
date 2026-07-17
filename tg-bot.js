@@ -66,10 +66,11 @@ async function handleMessage(msg) {
       await handleAdminSale(chatId, text);
       return;
     }
-    // Команды каталогом (ЧБ-10): «скрой Mad Max», «цена FC 26 4990», «скидка GTA V 20%»
-    if (/^(скрой|спрячь|покажи|верни|подними|снизь|поставь|цен[ауы]|скидк|убери)/i.test(text)) {
-      await handleAdminCatalog(chatId, text);
-      return;
+    // Команды каталогом (ЧБ-10): «скрой Mad Max», «цена FC 26 4990», «добавь на витрину GTA V», «инфо FC 26»
+    // handleAdminCatalog вернёт false, если LLM-парсер решил «это не про каталог» —
+    // тогда сообщение («Покажи весёлые RPG», «Верни мне деньги») идёт обычным путём клиентского бота.
+    if (/^(скрой|спрячь|покажи|верни|подними|снизь|поставь|цен[ауы]|скидк|убери|добавь|отметь|сделай|витрин|новинк|хит|популярн|инфо|карточк)/i.test(text)) {
+      if (await handleAdminCatalog(chatId, text)) return;
     }
     // Быстрые шаблоны не сработали, но сообщение похоже на админскую заметку —
     // LLM-роутер решает: продажа в свободной формулировке, команда каталогу или просто тест бота.
@@ -78,7 +79,7 @@ async function handleMessage(msg) {
       try {
         const intent = await adminRouter.classifyAdminIntent(text);
         if (intent === 'sale' || intent === 'renewal') { await handleAdminSale(chatId, text); return; }
-        if (intent === 'catalog') { await handleAdminCatalog(chatId, text); return; }
+        if (intent === 'catalog' && await handleAdminCatalog(chatId, text)) return;
       } catch (e) {
         console.error('[admin-router]', e.message); // роутер упал — идём обычным путём клиентского бота
       }
@@ -288,9 +289,12 @@ async function handleCallback(cbq) {
         const g = op.candidates?.[Number(extra)];
         if (!g) {
           answer = 'Вариант не найден, повтори команду';
+        } else if (op.action === 'info') {
+          pendingCatOps.delete(opId);
+          await tg('editMessageText', { chat_id: chatId, message_id: cbq.message.message_id, text: catInfoCard(g), parse_mode: 'HTML' });
         } else {
           op.game = g;
-          const noop = catNoopText(op.action, g);
+          const noop = catNoopText(op.action, g, op.flag);
           if (noop) {
             pendingCatOps.delete(opId);
             await tg('editMessageText', { chat_id: chatId, message_id: cbq.message.message_id, text: noop, parse_mode: 'HTML' });
@@ -309,10 +313,10 @@ async function handleCallback(cbq) {
         if (!op.game) {
           answer = 'Сначала выбери игру из списка';
         } else {
-          const updated = await catAdmin.applyOp({ action: op.action, gameId: op.game.id, value: op.value });
+          const updated = await catAdmin.applyOp({ action: op.action, gameId: op.game.id, value: op.value, flag: op.flag });
           pendingCatOps.delete(opId); // удаляем только после успешной записи — при ошибке кнопку можно нажать ещё раз
           answer = 'Записал в черновик ✅';
-          await tg('editMessageText', { chat_id: chatId, message_id: cbq.message.message_id, text: catAppliedText(op.action, updated), parse_mode: 'HTML' }).catch(() => {});
+          await tg('editMessageText', { chat_id: chatId, message_id: cbq.message.message_id, text: catAppliedText(op.action, updated, op.flag), parse_mode: 'HTML' }).catch(() => {});
         }
       }
     } catch (e) {
@@ -421,12 +425,26 @@ function fmtPrice(n) {
 }
 
 // Операция, которую применять не к чему («скрой» уже скрытую и т.п.) — вернёт текст, иначе null
-function catNoopText(action, g) {
+function catNoopText(action, g, flag) {
   const title = `<b>${escapeHtml(g.title)}</b>`;
   if (action === 'hide' && g.hidden) return `${title} уже скрыта из магазина.`;
   if (action === 'show' && !g.hidden) return `${title} и так видна в магазине.`;
   if (action === 'clear_discount' && !g.discount) return `У ${title} и так нет скидки.`;
+  if (action === 'set_flag' && g[flag]) return `У ${title} уже стоит флаг ${catAdmin.FLAG_LABELS[flag]}.`;
+  if (action === 'clear_flag' && !g[flag]) return `У ${title} и так нет флага ${catAdmin.FLAG_LABELS[flag]}.`;
   return null;
+}
+
+// Карточка игры для «инфо X» — read-only, без подтверждения
+function catInfoCard(g) {
+  const flags = Object.entries(catAdmin.FLAG_LABELS).filter(([k]) => g[k]).map(([, v]) => v).join(', ') || 'нет';
+  const lines = [
+    `<b>${escapeHtml(g.title)}</b> — ${fmtPrice(g.priceRUB)}${g.discount ? ` (скидка −${g.discount}%)` : ''}`,
+    g.hidden ? '🚫 Скрыта из магазина' : '✅ Видна в магазине',
+    `Флаги: ${flags}`,
+  ];
+  if (g._manualPrice) lines.push('🔒 Цена ручная (защищена от пересканирования)');
+  return lines.join('\n');
 }
 
 function catConfirmCard(op) {
@@ -441,10 +459,12 @@ function catConfirmCard(op) {
   }
   if (op.action === 'set_discount') body = `Скидка на ${title}: ${g.discount ? `−${g.discount}%` : 'нет'} → <b>−${op.value}%</b> (конечная цена ${fmtPrice(g.priceRUB)} не меняется).`;
   if (op.action === 'clear_discount') body = `Уберу скидку −${g.discount}% с ${title}.`;
+  if (op.action === 'set_flag') body = `Поставлю флаг <b>${catAdmin.FLAG_LABELS[op.flag]}</b> на ${title}.`;
+  if (op.action === 'clear_flag') body = `Сниму флаг <b>${catAdmin.FLAG_LABELS[op.flag]}</b> с ${title}.`;
   return `${body}\n\nЗапишу в черновик — на сайт попадёт после публикации из админки. Применить?`;
 }
 
-function catAppliedText(action, g) {
+function catAppliedText(action, g, flag) {
   const title = `<b>${escapeHtml(g.title)}</b>`;
   const what = {
     hide: `скрыл ${title}`,
@@ -452,30 +472,39 @@ function catAppliedText(action, g) {
     set_price: `цена ${title} теперь ${fmtPrice(g.priceRUB)}`,
     set_discount: `скидка на ${title} теперь −${g.discount}%`,
     clear_discount: `убрал скидку с ${title}`,
+    set_flag: `поставил ${catAdmin.FLAG_LABELS[flag]} на ${title}`,
+    clear_flag: `снял ${catAdmin.FLAG_LABELS[flag]} с ${title}`,
   }[action];
   return `✅ Записал в черновик: ${what}.\nНа сайте появится после публикации из админки.\n⚠️ Если админка сейчас открыта в браузере — переоткрой её перед публикацией, иначе её автосохранение затрёт эту правку.`;
 }
 
-// «скрой X / цена X N / скидка X N» — разбор через LLM, поиск игры, карточка-подтверждение
+// «скрой X / цена X N / скидка X N / витрина / инфо» — разбор через LLM, поиск игры, карточка-подтверждение.
+// Возвращает true, если сообщение обработано; false — если это не команда каталогу
+// (тогда вызывающий код отправит его обычным путём клиентского бота).
 async function handleAdminCatalog(chatId, text) {
   await tg('sendChatAction', { chat_id: chatId, action: 'typing' });
   try {
     const cmd = await catAdmin.parseCommand(text);
+    if (!cmd) return false; // LLM: «это не про каталог»
     const data = await catAdmin.loadDraftData();
     const matches = catAdmin.findGames(data.games || [], cmd.game);
     if (!matches.length) {
       await tg('sendMessage', { chat_id: chatId, text: `Не нашёл «${escapeHtml(cmd.game)}» в каталоге (искал и среди скрытых).`, parse_mode: 'HTML' });
-      return;
+      return true;
     }
     prunePendingCatOps();
     const opId = crypto.randomUUID().replace(/-/g, '').slice(0, 8);
-    const op = { action: cmd.action, value: cmd.value, createdAt: Date.now() };
+    const op = { action: cmd.action, value: cmd.value, flag: cmd.flag, createdAt: Date.now() };
     if (matches.length === 1) {
       const g = matches[0];
-      const noop = catNoopText(cmd.action, g);
+      if (cmd.action === 'info') {
+        await tg('sendMessage', { chat_id: chatId, text: catInfoCard(g), parse_mode: 'HTML' });
+        return true;
+      }
+      const noop = catNoopText(cmd.action, g, cmd.flag);
       if (noop) {
         await tg('sendMessage', { chat_id: chatId, text: noop, parse_mode: 'HTML' });
-        return;
+        return true;
       }
       op.game = g;
       pendingCatOps.set(opId, op);
@@ -503,6 +532,7 @@ async function handleAdminCatalog(chatId, text) {
     console.error('[cat-admin]', e.message);
     await tg('sendMessage', { chat_id: chatId, text: `⚠️ ${e.message}` });
   }
+  return true;
 }
 
 // Ежедневно: напоминания владельцу за 5 дней и в день окончания, с черновиком сообщения клиенту

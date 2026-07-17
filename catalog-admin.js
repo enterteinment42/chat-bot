@@ -7,33 +7,52 @@ import { extractJson } from './crm.js';
 
 const STORE_API = (process.env.STORE_API_URL || 'https://api.poigraem.shop').replace(/\/+$/, '');
 
-const ACTIONS = new Set(['hide', 'show', 'set_price', 'set_discount', 'clear_discount']);
+const ACTIONS = new Set(['hide', 'show', 'set_price', 'set_discount', 'clear_discount', 'set_flag', 'clear_flag', 'info']);
+
+// Витринные флаги снапшота магазина (те же поля читает catalog.js для промта бота)
+export const FLAG_LABELS = { featured: '⭐ витрина', isNew: '🆕 новинка', popular: '🔥 хит' };
 
 const PARSE_PROMPT = `Ты — парсер команд владельца магазина игр по управлению каталогом. Владелец пишет короткую команду. Верни СТРОГО один JSON-объект без пояснений:
 {
-  "action": "hide" | "show" | "set_price" | "set_discount" | "clear_discount",
+  "action": "hide" | "show" | "set_price" | "set_discount" | "clear_discount" | "set_flag" | "clear_flag" | "info",
   "game": string,          // название игры из команды, без служебных слов («игру», «цену», предлогов)
-  "value": number | null   // set_price — новая цена в рублях; set_discount — процент скидки; иначе null
+  "value": number | null,  // set_price — новая цена в рублях; set_discount — процент скидки; иначе null
+  "flag": "featured" | "isNew" | "popular" | null  // только для set_flag/clear_flag: витрина=featured, новинка=isNew, хит/популярная=popular
 }
 Примеры:
-«скрой Mad Max» → {"action":"hide","game":"Mad Max","value":null}
-«покажи Mad Max» или «верни Mad Max» → {"action":"show","game":"Mad Max","value":null}
-«цена FC 26 4990» или «подними цену FC 26 до 4990» → {"action":"set_price","game":"FC 26","value":4990}
-«скидка на GTA V 20%» → {"action":"set_discount","game":"GTA V","value":20}
-«убери скидку с GTA V» → {"action":"clear_discount","game":"GTA V","value":null}
-Если команда не про каталог игр или непонятна — верни {"action":null,"game":null,"value":null}. Ничего не выдумывай.`;
+«скрой Mad Max» → {"action":"hide","game":"Mad Max","value":null,"flag":null}
+«покажи Mad Max» или «верни Mad Max» → {"action":"show","game":"Mad Max","value":null,"flag":null}
+«цена FC 26 4990» или «подними цену FC 26 до 4990» → {"action":"set_price","game":"FC 26","value":4990,"flag":null}
+«скидка на GTA V 20%» → {"action":"set_discount","game":"GTA V","value":20,"flag":null}
+«убери скидку с GTA V» → {"action":"clear_discount","game":"GTA V","value":null,"flag":null}
+«добавь на витрину GTA V» → {"action":"set_flag","game":"GTA V","value":null,"flag":"featured"}
+«убери с витрины GTA V» → {"action":"clear_flag","game":"GTA V","value":null,"flag":"featured"}
+«отметь новинкой FC 26» → {"action":"set_flag","game":"FC 26","value":null,"flag":"isNew"}
+«сделай хитом Mad Max» или «отметь популярной Mad Max» → {"action":"set_flag","game":"Mad Max","value":null,"flag":"popular"}
+«убери хит с Mad Max» → {"action":"clear_flag","game":"Mad Max","value":null,"flag":"popular"}
+«инфо FC 26» или «покажи карточку FC 26» → {"action":"info","game":"FC 26","value":null,"flag":null}
+Если команда не про каталог игр или непонятна — верни {"action":null,"game":null,"value":null,"flag":null}. Ничего не выдумывай.`;
 
-// Разбирает команду владельца. Бросает Error с человекочитаемым текстом.
+// Разбирает команду владельца. Вернёт null, если LLM решил, что это не команда каталогу
+// (тогда сообщение должно уйти обычным путём). Бросает Error с человекочитаемым текстом.
 export async function parseCommand(text) {
   const res = await chat([
     { role: 'system', content: PARSE_PROMPT },
     { role: 'user', content: text },
   ]);
   const p = extractJson(res.content);
+  if (p && p.action === null) return null;
   if (!p || !ACTIONS.has(p.action) || typeof p.game !== 'string' || !p.game.trim()) {
-    throw new Error('Не понял команду. Примеры: «скрой Mad Max», «цена FC 26 4990», «скидка GTA V 20%», «убери скидку с GTA V».');
+    throw new Error('Не понял команду. Примеры: «скрой Mad Max», «цена FC 26 4990», «скидка GTA V 20%», «добавь на витрину GTA V», «инфо FC 26».');
   }
   p.game = p.game.trim().slice(0, 100);
+  if (p.action === 'set_flag' || p.action === 'clear_flag') {
+    if (!Object.hasOwn(FLAG_LABELS, p.flag)) {
+      throw new Error('Не понял, какой флаг: витрина, новинка или хит. Например: «добавь на витрину GTA V».');
+    }
+  } else {
+    p.flag = null;
+  }
   if (p.action === 'set_price') {
     p.value = Math.round(Number(p.value));
     if (!Number.isFinite(p.value) || p.value < 10 || p.value > 500000) {
@@ -84,11 +103,15 @@ export function findGames(games, query) {
 
 // Применяет подтверждённую операцию: свежий черновик → правка одного поля → запись целиком.
 // Черновик всегда перечитывается прямо перед записью, чтобы не затереть параллельные правки.
-export async function applyOp({ action, gameId, value }) {
+export async function applyOp({ action, gameId, value, flag }) {
   const data = await loadDraftData();
   const game = (data.games || []).find(g => String(g.id) === String(gameId));
   if (!game) throw new Error('Игра не нашлась в черновике — каталог изменился, повтори команду.');
-  if (action === 'hide') game.hidden = true;
+  if (action === 'set_flag' || action === 'clear_flag') {
+    if (!Object.hasOwn(FLAG_LABELS, flag)) throw new Error(`Неизвестный флаг: ${flag}`);
+    game[flag] = action === 'set_flag';
+  }
+  else if (action === 'hide') game.hidden = true;
   else if (action === 'show') game.hidden = false;
   else if (action === 'set_price') { game.priceRUB = value; game._manualPrice = true; } // замок от пересканирования цен
   else if (action === 'set_discount') game.discount = value;
