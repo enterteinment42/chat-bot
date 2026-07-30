@@ -410,7 +410,19 @@ async function sendClientList(chatId) {
       const when = d < 0 ? `закончилась ${crm.fmtDate(r.expires_at)} ❗️` : d === 0 ? 'заканчивается сегодня ❗️' : `до ${crm.fmtDate(r.expires_at)} (через ${d} дн)`;
       return `• ${clientLabel(r)} — ${escapeHtml(r.sub_name)}, ${when}${statusMark[r.status] || ''}`;
     });
-    await tg('sendMessage', { chat_id: chatId, text: `📋 <b>Подписки клиентов</b>\n\n${lines.join('\n')}`, parse_mode: 'HTML', disable_web_page_preview: true });
+    // TG режет сообщения длиннее 4096 символов, а список уже не влезает в одно (63 клиента
+    // с HTML-ссылками ≈ 6–7 тыс. знаков) — бьём на пачки с запасом и шлём по очереди.
+    const chunks = [];
+    for (const line of lines) {
+      const last = chunks[chunks.length - 1];
+      if (last && last.length + line.length + 1 <= 3500) chunks[chunks.length - 1] = `${last}\n${line}`;
+      else chunks.push(line);
+    }
+    for (let i = 0; i < chunks.length; i++) {
+      const head = i === 0 ? `📋 <b>Подписки клиентов</b> — всего ${rows.length}\n\n` : '';
+      const foot = chunks.length > 1 ? `\n\n<i>${i + 1}/${chunks.length}</i>` : '';
+      await tg('sendMessage', { chat_id: chatId, text: head + chunks[i] + foot, parse_mode: 'HTML', disable_web_page_preview: true });
+    }
   } catch (e) {
     console.error('[crm list]', e.message);
     await tg('sendMessage', { chat_id: chatId, text: `⚠️ Не удалось получить список: ${e.message}` });

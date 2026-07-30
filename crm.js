@@ -240,7 +240,10 @@ export async function listClients() {
     .select('*')
     .neq('status', 'lost')
     .order('expires_at', { ascending: true })
-    .limit(25);
+    // Лимит 25 обрезал список молча: клиенты с дальней датой окончания просто не показывались
+    // (30.07.2026 — 63 активных записи, видно было 25). Отправка списка бьётся на несколько
+    // сообщений, поэтому потолок TG в 4096 символов больше не ограничивает выборку.
+    .limit(200);
   if (error) throw new Error(error.message);
   return data || [];
 }
