@@ -337,4 +337,4 @@ app.post('/api/sub-reminder/init', reminderLimit, async (req, res) => {
 
 bootstrapSettings().catch(err => console.warn('Bootstrap (non-fatal):', err.message));
 
-app.listen(PORT, () => console.log(`Chatbot запущен на порту ${PORT}`));
+app.listen(PORT, '127.0.0.1', () => console.log(`Chatbot запущен на порту ${PORT}`));
