@@ -57,6 +57,10 @@ async function handleMessage(msg) {
 
   // Мини-CRM: команды владельца (все остальные его сообщения идут обычным путём — бота можно тестировать)
   if (ADMIN_CHAT_ID && chatId === ADMIN_CHAT_ID) {
+    if (/^(\/admin|\/help|шпаргалка|команды)$/i.test(text)) {
+      await tg('sendMessage', { chat_id: chatId, text: ADMIN_HELP, parse_mode: 'HTML', disable_web_page_preview: true });
+      return;
+    }
     if (/^(\/clients|клиенты)$/i.test(text)) {
       await sendClientList(chatId);
       return;
@@ -64,6 +68,12 @@ async function handleMessage(msg) {
     // (\s|$) вместо \b: в JS \b не работает после кириллицы — «продал ...» никогда не совпадал
     if (/^(продал|продлил|оформил|\/sold)(\s|$)/i.test(text)) {
       await handleAdminSale(chatId, text);
+      return;
+    }
+    // Правка записей CRM. Стоит ДО команд каталогом: «удали»/«измени» здесь про клиента,
+    // а не про игру на витрине (у каталога свои глаголы — скрой/цена/скидка/добавь).
+    if (/^(удали|удалить|измени|изменить|поменяй|исправь|переименуй|забудь|телефон|контакт)(\s|$)/i.test(text)) {
+      await handleAdminEdit(chatId, text);
       return;
     }
     // Команды каталогом (ЧБ-10): «скрой Mad Max», «цена FC 26 4990», «добавь на витрину GTA V», «инфо FC 26»
@@ -241,6 +251,61 @@ async function handleCallback(cbq) {
   const chatId = cbq.message?.chat?.id;
   const data   = cbq.data || '';
 
+  // Кнопки редактирования записей — только для владельца
+  if (data.startsWith('ce:')) {
+    if (cbq.from?.id !== ADMIN_CHAT_ID) { await tg('answerCallbackQuery', { callback_query_id: cbq.id }); return; }
+    const [, action, opId, extra] = data.split(':');
+    const op = pendingEditOps.get(opId);
+    let answer = 'Готово';
+    try {
+      if (!op) answer = 'Кнопка устарела — повтори команду';
+      else if (action === 'no') { pendingEditOps.delete(opId); answer = 'Отменил'; }
+      else if (action === 'row') {
+        const row = op.rows?.[Number(extra)];
+        pendingEditOps.delete(opId);
+        if (!row) answer = 'Не понял выбор';
+        else { await askEditConfirm(chatId, op.cmd, row); answer = 'Показал карточку'; }
+      } else if (action === 'ok') {
+        pendingEditOps.delete(opId);
+        const { cmd, row } = op;
+        if (cmd.action === 'delete') {
+          await crm.removeRecord(row.id);
+          const undoId = newEditOp({ deletedRow: row });
+          await tg('sendMessage', {
+            chat_id: chatId,
+            text: `🗑 Удалил: ${recordCard(row)}`,
+            parse_mode: 'HTML', disable_web_page_preview: true,
+            reply_markup: { inline_keyboard: [[{ text: '↩️ Восстановить', callback_data: `ce:undo:${undoId}` }]] },
+          });
+          answer = 'Удалил';
+        } else {
+          const before = row[cmd.field];
+          const updated = await crm.updateField(row.id, cmd.field, cmd.value);
+          const undoId = newEditOp({ revert: { id: row.id, field: cmd.field, value: before } });
+          await tg('sendMessage', {
+            chat_id: chatId,
+            text: `✏️ Изменил <b>${crm.EDITABLE_FIELDS[cmd.field]}</b>: ${fmtFieldValue(cmd.field, before)} → <b>${fmtFieldValue(cmd.field, cmd.value)}</b>\n\n${recordCard(updated)}`,
+            parse_mode: 'HTML', disable_web_page_preview: true,
+            reply_markup: { inline_keyboard: [[{ text: '↩️ Вернуть как было', callback_data: `ce:undo:${undoId}` }]] },
+          });
+          answer = 'Изменил';
+        }
+      } else if (action === 'undo') {
+        pendingEditOps.delete(opId);
+        if (op.deletedRow) { const back = await crm.reinsertRecord(op.deletedRow); answer = `Восстановил (id=${back.id})`; }
+        else if (op.revert) { await crm.updateField(op.revert.id, op.revert.field, op.revert.value); answer = 'Вернул как было'; }
+      }
+      if (cbq.message) {
+        await tg('editMessageReplyMarkup', { chat_id: chatId, message_id: cbq.message.message_id, reply_markup: { inline_keyboard: [] } }).catch(() => {});
+      }
+    } catch (e) {
+      console.error('[crm edit callback]', e.message);
+      answer = `Ошибка: ${e.message}`.slice(0, 190);
+    }
+    await tg('answerCallbackQuery', { callback_query_id: cbq.id, text: answer });
+    return;
+  }
+
   // Кнопки мини-CRM — только для владельца
   if (data.startsWith('cs:')) {
     if (cbq.from?.id !== ADMIN_CHAT_ID) {
@@ -250,11 +315,44 @@ async function handleCallback(cbq) {
     const [, action, id, extra] = data.split(':');
     let answer = 'Готово';
     try {
+      // Выбор клиента из тёзок перед продлением: id здесь — opId, extra — номер группы или 'x'
+      if (action === 'pick') {
+        const op = pendingSaleOps.get(id);
+        if (!op) answer = 'Кнопка устарела — напиши продление заново';
+        else if (extra === 'x') { pendingSaleOps.delete(id); answer = 'Отменил'; }
+        else {
+          const group = op.groups[Number(extra)];
+          if (!group) answer = 'Не понял выбор';
+          else {
+            pendingSaleOps.delete(id);
+            await handleAdminSale(chatId, '', {
+              parsed: {
+                ...op.parsed,
+                identity_locked: true, // клиент выбран — на сторону больше не смотрим
+                target_ids: crm.targetIdsFor(group, op.parsed.subs),
+                channel: group.channel,
+                client_link: op.parsed.client_link || group.link,
+              },
+            });
+            answer = 'Готово';
+          }
+        }
+      }
       if (action === 'ok')  { await crm.setStatus(Number(id), 'contacted'); answer = 'Отметил: написал ✅'; }
       if (action === 'no')  { await crm.setStatus(Number(id), 'lost'); answer = 'Отметил: не продлил'; }
       if (action === 'tm')  { await crm.snooze(Number(id), Number(extra)); answer = 'Напомню завтра 🔁'; }
-      if (action === 'del') { await crm.removeRecord(Number(id)); answer = 'Запись удалена'; }
-      if (action === 'rvt') { await crm.restoreExpires(Number(id), extra); answer = `Вернул дату: ${crm.fmtDate(extra)}`; }
+      // id и extra могут быть списками через запятую: одна заметка = несколько записей
+      if (action === 'del') {
+        const ids = id.split(',');
+        for (const one of ids) await crm.removeRecord(Number(one));
+        answer = ids.length > 1 ? `Удалено записей: ${ids.length}` : 'Запись удалена';
+      }
+      if (action === 'rvt') {
+        const ids = id.split(',');
+        const dates = String(extra).split(',');
+        for (let i = 0; i < ids.length; i++) await crm.restoreExpires(Number(ids[i]), dates[i]);
+        answer = ids.length > 1 ? `Вернул прежние даты (${ids.length})` : `Вернул дату: ${crm.fmtDate(extra)}`;
+      }
       if (action === 'rn')  {
         // «Продлил на тот же срок» из напоминания — карточка как у «продлил …» текстом
         const { record, prevExpires } = await crm.renewSame(Number(id));
@@ -374,28 +472,145 @@ async function handleCallback(cbq) {
 function clientLabel(r) {
   const name = escapeHtml(r.client_name);
   const channel = crm.CHANNEL_LABELS[r.channel] || r.channel;
-  return (r.client_link ? `<a href="${escapeHtml(r.client_link)}">${name}</a>` : `<b>${name}</b>`) + ` (${channel})`;
+  // Аккаунт продавца — прямо в подписи: по нему видно, откуда писать клиенту («Авито: Денис»)
+  const where = r.seller_account ? `${channel}: ${escapeHtml(r.seller_account)}` : channel;
+  return (r.client_link ? `<a href="${escapeHtml(r.client_link)}">${name}</a>` : `<b>${name}</b>`) + ` (${where})`;
 }
 
+// Строка с реквизитами для напоминания: как найти клиента и чем открыть его подписку.
+// Без них напоминание бесполезно для клиентов без username — а таких большинство.
+function contactLine(r) {
+  const parts = [];
+  if (r.contact) parts.push(`📇 ${escapeHtml(r.contact)}`);
+  if (r.account_login) parts.push(`🔑 ${escapeHtml(r.account_login)}`);
+  if (r.note) parts.push(`📝 ${escapeHtml(r.note)}`);
+  return parts.length ? `\n${parts.join('   ')}` : '';
+}
+
+// Продления, ждущие выбора клиента из тёзок: opId → { parsed, groups, createdAt }.
+// В памяти, как и pendingCatOps: после рестарта кнопка ответит «устарело».
+const pendingSaleOps = new Map();
+const SALE_OP_TTL = 15 * 60 * 1000;
+
 // «продал/продлил ...» — разбор через LLM, запись в client_subs, карточка-подтверждение
-async function handleAdminSale(chatId, text) {
+// opts.parsed — готовый разбор (возврат после выбора клиента кнопкой), чтобы не гонять LLM дважды
+async function handleAdminSale(chatId, text, opts = {}) {
   await tg('sendChatAction', { chat_id: chatId, action: 'typing' });
   try {
-    const parsed = await crm.parseSale(text);
-    const { record, renewed, prevExpires } = await crm.recordSale(parsed);
-    let card = `${renewed ? '🔁 Продлил' : '✅ Записал'}: ${clientLabel(record)} — <b>${escapeHtml(record.sub_name)}</b> до ${crm.fmtDate(record.expires_at)}`;
-    if (renewed) card += `\n(было до ${crm.fmtDate(prevExpires)})`;
-    if (record.note) card += `\n📝 ${escapeHtml(record.note)}`;
+    const parsed = opts.parsed || await crm.parseSale(text);
+
+    // Тёзки: под «продлил Владимиру PS Plus Extra» может подойти несколько разных клиентов.
+    // Раньше молча продлевалась запись с самой дальней датой — могли продлить чужую.
+    if (parsed.intent === 'renewal' && !parsed.identity_locked) {
+      const groups = await crm.renewalIdentityGroups(parsed);
+      if (groups.length > 1) {
+        for (const [id, op] of pendingSaleOps) if (Date.now() - op.createdAt > SALE_OP_TTL) pendingSaleOps.delete(id);
+        const opId = crypto.randomUUID().replace(/-/g, '').slice(0, 8);
+        pendingSaleOps.set(opId, { parsed, groups, createdAt: Date.now() });
+        const rows = groups.map((g, i) => {
+          const who = g.link || g.note || `запись #${g.rows[0].id}`;
+          const what = g.rows.map(r => `${r.sub_name} до ${crm.fmtDate(r.expires_at)}`).join(', ');
+          return [{ text: `${who} — ${what}`.slice(0, 64), callback_data: `cs:pick:${opId}:${i}` }];
+        });
+        rows.push([{ text: '❌ Отмена', callback_data: `cs:pick:${opId}:x` }]);
+        await tg('sendMessage', {
+          chat_id: chatId,
+          text: `🤔 Под «${escapeHtml(parsed.client_name)}» подходит ${groups.length} разных клиента. Кого продлить?`,
+          parse_mode: 'HTML',
+          reply_markup: { inline_keyboard: rows },
+        });
+        return;
+      }
+    }
+
+    const { saved, failed } = await crm.recordSales(parsed);
+    const first = saved[0].record;
+
+    let card;
+    if (saved.length === 1) {
+      const { record, renewed, prevExpires } = saved[0];
+      card = `${renewed ? '🔁 Продлил' : '✅ Записал'}: ${clientLabel(record)} — <b>${escapeHtml(record.sub_name)}</b> до ${crm.fmtDate(record.expires_at)}`;
+      if (renewed) card += `\n(было до ${crm.fmtDate(prevExpires)})`;
+    } else {
+      // Несколько подписок одной заметкой — клиент в шапке, подписки списком
+      card = `${saved.every(s => s.renewed) ? '🔁 Продлил' : '✅ Записал'}: ${clientLabel(first)}`;
+      for (const s of saved) {
+        card += `\n  • <b>${escapeHtml(s.record.sub_name)}</b> — до ${crm.fmtDate(s.record.expires_at)}`;
+        if (s.renewed) card += ` (было до ${crm.fmtDate(s.prevExpires)})`;
+      }
+    }
+    for (const f of failed) card += `\n  ⚠️ <b>${escapeHtml(f.sub)}</b> — не записал: ${escapeHtml(f.message)}`;
+    card += contactLine(first);
     card += `\n\nНапомню за 5 дней до окончания и в день окончания. Список: /clients`;
-    const buttons = renewed
-      ? [[{ text: '↩️ Вернуть прежнюю дату', callback_data: `cs:rvt:${record.id}:${prevExpires}` }]]
-      : [[{ text: '❌ Отменить запись', callback_data: `cs:del:${record.id}` }]];
+
+    // Кнопки строим по фактическому исходу: новые записи можно отменить, продлённые — откатить
+    // к прежней дате. В одной заметке может оказаться и то, и другое (одна подписка у клиента
+    // была, вторая новая) — тогда показываем обе кнопки, каждая на свой набор id.
+    const fresh = saved.filter(s => !s.renewed).map(s => s.record.id);
+    const renewedOnes = saved.filter(s => s.renewed);
+    const buttons = [];
+    if (fresh.length) {
+      buttons.push([{ text: fresh.length > 1 ? `❌ Отменить записи (${fresh.length})` : '❌ Отменить запись', callback_data: `cs:del:${fresh.join(',')}` }]);
+    }
+    if (renewedOnes.length) {
+      const cb = `cs:rvt:${renewedOnes.map(s => s.record.id).join(',')}:${renewedOnes.map(s => s.prevExpires).join(',')}`;
+      // callback_data у Telegram — максимум 64 байта; при длинном списке кнопку не рисуем
+      if (Buffer.byteLength(cb) <= 64) buttons.push([{ text: '↩️ Вернуть прежнюю дату', callback_data: cb }]);
+    }
     await tg('sendMessage', { chat_id: chatId, text: card, parse_mode: 'HTML', disable_web_page_preview: true, reply_markup: { inline_keyboard: buttons } });
   } catch (e) {
     console.error('[crm sale]', e.message);
     await tg('sendMessage', { chat_id: chatId, text: `⚠️ ${e.message}` });
   }
 }
+
+// Шпаргалка по админским командам. Отдаётся ТОЛЬКО владельцу (вызов стоит внутри
+// гейта по ADMIN_CHAT_ID) — у клиента «/admin» уйдёт в обычный чат с ботом, как любой
+// другой текст, и существование этих команд ничем себя не выдаст.
+const ADMIN_HELP = `📖 <b>Шпаргалка владельца</b>
+Примеры можно тапнуть — скопируются.
+
+<b>1. Клиенты и подписки</b>
+/clients — весь список, ближайшие к окончанию сверху
+
+Записать продажу — свободным текстом:
+<code>продал Ивану с авито PS Plus Extra на 12 мес</code>
+<code>18 января оформил Ивану пс+ экстра на год</code>
+<code>оформил Ивану пс+ экстра и еа плей на год</code>
+<code>продал Ивану пс+ экстра до 18 января 2027</code>
+
+В ту же фразу можно добавить:
+• <code>телефон +7 900 123 45 67</code> — контакт клиента
+• <code>с аккаунта Денис</code> — с какого аккаунта Авито продано
+• <code>почта gebbe720@gmail.com</code> — логин самой подписки
+
+Продлить:
+<code>продлил Ивану EA Play на 6 мес</code>
+<code>продлил Ивану EA Play до 5 сентября</code>
+
+<b>2. Правка записей</b>
+<code>удали Ивана PS Plus</code>
+<code>измени дату Ивану на 5 сентября</code>
+<code>поменяй телефон Ивану на +7 900 123 45 67</code>
+<code>исправь аккаунт у Ивана на Денис</code>
+<code>переименуй Ивана в Иван Петров</code>
+Менять можно: дату окончания, контакт, аккаунт продавца, логин подписки, имя, ссылку на профиль, название подписки, заметку.
+
+<b>3. Каталог магазина</b>
+<code>скрой Mad Max</code> · <code>верни Mad Max</code>
+<code>цена FC 26 4990</code>
+<code>скидка на GTA V 20%</code> · <code>убери скидку с GTA V</code>
+<code>добавь на витрину GTA V</code> · <code>убери с витрины GTA V</code>
+<code>отметь новинкой FC 26</code>
+<code>сделай хитом Mad Max</code> · <code>убери хит с Mad Max</code>
+<code>инфо FC 26</code>
+Правки уходят в черновик магазина — публикация остаётся ручной, из админки.
+
+<b>Как это работает</b>
+• Тёзки: если под имя подходит несколько клиентов, бот спросит кого именно, а не угадает сам.
+• Удаление и правка — только после подтверждения кнопкой, с кнопкой отката после.
+• Кнопки живут 15 минут и не переживают перезапуск бота.
+• Всё прочее, что ты напишешь, бот примет как обычный вопрос клиента — на нём же можно тестировать.`;
 
 async function sendClientList(chatId) {
   try {
@@ -426,6 +641,84 @@ async function sendClientList(chatId) {
   } catch (e) {
     console.error('[crm list]', e.message);
     await tg('sendMessage', { chat_id: chatId, text: `⚠️ Не удалось получить список: ${e.message}` });
+  }
+}
+
+// ===== Редактирование записей текстом: «удали Ивана PS Plus», «измени дату Ивану на 5 сентября» =====
+// Правило: НИКОГДА не менять запись без явного подтверждения владельца. Имён-тёзок много
+// («Иванов может быть много»), и молчаливое «похоже, это он» здесь недопустимо — сначала
+// показываем полную карточку той записи, которую тронем, и ждём кнопку.
+
+const pendingEditOps = new Map();
+const EDIT_OP_TTL = 15 * 60 * 1000;
+
+function newEditOp(op) {
+  for (const [id, o] of pendingEditOps) if (Date.now() - o.createdAt > EDIT_OP_TTL) pendingEditOps.delete(id);
+  const opId = crypto.randomUUID().replace(/-/g, '').slice(0, 8);
+  pendingEditOps.set(opId, { ...op, createdAt: Date.now() });
+  return opId;
+}
+
+// Полная карточка записи — по ней владелец опознаёт, та ли это строка
+function recordCard(r) {
+  let s = `${clientLabel(r)} — <b>${escapeHtml(r.sub_name)}</b>\nдо ${crm.fmtDate(r.expires_at)}`;
+  const line = contactLine(r);
+  if (line) s += line;
+  return s;
+}
+
+function fmtFieldValue(field, value) {
+  if (value == null || value === '') return '(пусто)';
+  return field === 'expires_at' ? crm.fmtDate(value) : escapeHtml(String(value));
+}
+
+async function askEditConfirm(chatId, cmd, row) {
+  const opId = newEditOp({ cmd, row });
+  let what;
+  if (cmd.action === 'delete') {
+    what = '🗑 <b>удалю эту запись целиком</b>';
+  } else {
+    const label = crm.EDITABLE_FIELDS[cmd.field];
+    what = `✏️ изменю <b>${label}</b>:\n${fmtFieldValue(cmd.field, row[cmd.field])} → <b>${fmtFieldValue(cmd.field, cmd.value)}</b>`;
+  }
+  await tg('sendMessage', {
+    chat_id: chatId,
+    text: `❗️ Проверь, та ли запись:\n\n${recordCard(row)}\n\nЧто сделаю: ${what}`,
+    parse_mode: 'HTML',
+    disable_web_page_preview: true,
+    reply_markup: { inline_keyboard: [[
+      { text: cmd.action === 'delete' ? '✅ Да, удалить' : '✅ Да, изменить', callback_data: `ce:ok:${opId}` },
+      { text: '❌ Отмена', callback_data: `ce:no:${opId}` },
+    ]] },
+  });
+}
+
+async function handleAdminEdit(chatId, text) {
+  await tg('sendChatAction', { chat_id: chatId, action: 'typing' });
+  try {
+    const cmd = await crm.parseEdit(text);
+    const rows = await crm.findRecords(cmd);
+    if (!rows.length) {
+      await tg('sendMessage', { chat_id: chatId, text: `Не нашёл записей по «${cmd.client_name}»${cmd.sub_name ? ` с подпиской «${cmd.sub_name}»` : ''}. Посмотри список: /clients` });
+      return;
+    }
+    if (rows.length === 1) { await askEditConfirm(chatId, cmd, rows[0]); return; }
+    // Несколько совпадений — выбор строки за владельцем, сами не угадываем
+    const opId = newEditOp({ cmd, rows });
+    const keyboard = rows.slice(0, 12).map((r, i) => [{
+      text: `${r.client_name}${r.seller_account ? ` (${r.seller_account})` : ''} — ${r.sub_name} до ${crm.fmtDate(r.expires_at)}`.slice(0, 64),
+      callback_data: `ce:row:${opId}:${i}`,
+    }]);
+    keyboard.push([{ text: '❌ Отмена', callback_data: `ce:no:${opId}` }]);
+    await tg('sendMessage', {
+      chat_id: chatId,
+      text: `🤔 Под «${escapeHtml(cmd.client_name)}» подходит ${rows.length} записей. Какую?`,
+      parse_mode: 'HTML',
+      reply_markup: { inline_keyboard: keyboard },
+    });
+  } catch (e) {
+    console.error('[crm edit]', e.message);
+    await tg('sendMessage', { chat_id: chatId, text: `⚠️ ${e.message}` });
   }
 }
 
@@ -569,7 +862,7 @@ async function checkClientSubs() {
         try {
           const d = crm.daysLeft(r.expires_at);
           const when = d > 0 ? `через ${d} дн (${crm.fmtDate(r.expires_at)})` : d === 0 ? '<b>сегодня</b>' : `уже закончилась ${crm.fmtDate(r.expires_at)} ❗️`;
-          let text = `⏰ У ${clientLabel(r)} ${d < 0 ? '' : 'заканчивается '}<b>${escapeHtml(r.sub_name)}</b> — ${when}.`;
+          let text = `⏰ У ${clientLabel(r)} ${d < 0 ? '' : 'заканчивается '}<b>${escapeHtml(r.sub_name)}</b> — ${when}.${contactLine(r)}`;
           try {
             const draft = await crm.draftClientMessage(r);
             text += `\n\nЧерновик для клиента (тапни — скопируется):\n<code>${escapeHtml(draft)}</code>`;
